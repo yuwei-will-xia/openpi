@@ -264,10 +264,34 @@ class BaseModel(nnx.Module, abc.ABC):
         actions: Actions,
         *,
         train: bool = False,
-    ) -> at.Float[at.Array, "*b ah"]: ...
+    ) -> dict[str, at.Array]:
+        """Compute the loss for training.
+        
+        Args:
+            rng: Random number generator key.
+            observation: The observation to compute the loss for.
+            actions: The ground truth actions.
+            train: Whether we are in training mode.
+            
+        Returns:
+            Dictionary containing:
+                - loss: The loss value for training
+                - predicted_actions: The model's predicted actions
+        """
+        ...
 
     @abc.abstractmethod
-    def sample_actions(self, rng: at.KeyArrayLike, observation: Observation) -> Actions: ...
+    def sample_actions(self, rng: at.KeyArrayLike, observation: Observation) -> Actions:
+        """Sample actions from the model.
+        
+        Args:
+            rng: Random number generator key.
+            observation: The observation to sample actions for.
+            
+        Returns:
+            The sampled actions.
+        """
+        ...
 
 
 def restore_params(

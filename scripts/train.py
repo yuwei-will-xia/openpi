@@ -25,6 +25,7 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+import openpi.training.visualization as _visualization
 
 
 def init_logging():
@@ -138,7 +139,7 @@ def train_step(
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
-) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+) -> tuple[training_utils.TrainState, dict[str, at.Array], dict[str, Any]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
@@ -146,15 +147,23 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        model_outputs = model.compute_loss(rng, observation, actions, train=True)
+        # Extract loss from model outputs
+        if isinstance(model_outputs, dict):
+            loss = model_outputs["loss"]
+        else:
+            # For backwards compatibility
+            loss = model_outputs
+        return jnp.mean(loss), model_outputs
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, model_outputs), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -187,10 +196,11 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
-    return new_state, info
+    return new_state, info, model_outputs
 
 
 def main(config: _config.TrainConfig):
+    """Main training loop."""
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -233,10 +243,13 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
+    # Create visualization callback if enabled
+    viz_callback = _visualization.create_visualization_callback(config) if config.visualization_enabled else None
+
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
+        out_shardings=(train_state_sharding, replicated_sharding, replicated_sharding),  # Added sharding for model_outputs
         donate_argnums=(1,),
     )
 
@@ -251,7 +264,12 @@ def main(config: _config.TrainConfig):
     infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
+            train_state, info, model_outputs = ptrain_step(train_rng, train_state, batch)
+            
+            # Process visualizations if enabled
+            if viz_callback is not None:
+                info = viz_callback.process_train_step(step, info, batch, model_outputs)
+
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
