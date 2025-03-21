@@ -224,7 +224,16 @@ class Pi0FAST(_model.BaseModel):
         assert observation.token_loss_mask is not None, "Token loss mask is required"
         loss_mask = observation.token_loss_mask[:, 1:]
         token_pplx = jnp.sum(targets * logp, axis=-1)
-        return -jnp.sum(token_pplx * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, -1), 1)
+        loss = -jnp.sum(token_pplx * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, -1), 1)
+
+        # Sample predicted actions for visualization
+        pred_actions = self.sample_actions(rng, observation)
+
+        # Return both loss and predicted actions
+        return {
+            "loss": loss,
+            "predicted_actions": pred_actions
+        }
 
     @override
     def sample_actions(
