@@ -25,6 +25,7 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+import openpi.training.visualization as _visualization
 
 
 def init_logging():
@@ -138,7 +139,7 @@ def train_step(
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
-) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+) -> tuple[training_utils.TrainState, dict[str, at.Array], dict[str, Any]]:
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
@@ -146,15 +147,23 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        model_outputs = model.compute_loss(rng, observation, actions, train=True)
+        # Extract loss from model outputs
+        if isinstance(model_outputs, dict):
+            loss = model_outputs["loss"]
+        else:
+            # For backwards compatibility
+            loss = model_outputs
+        return jnp.mean(loss), model_outputs
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, model_outputs), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -186,11 +195,14 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        "model_def": state.model_def,
+        "params": state.params,
     }
-    return new_state, info
+    return new_state, info, model_outputs
 
 
 def main(config: _config.TrainConfig):
+    """Main training loop."""
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -216,29 +228,42 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
-    data_loader = _data_loader.create_data_loader(
+    # Create train and validation data loaders
+    train_loader, val_loader = _data_loader.create_train_val_loaders(
         config,
         sharding=data_sharding,
         num_workers=config.num_workers,
-        shuffle=True,
     )
-    data_iter = iter(data_loader)
-    batch = next(data_iter)
-    logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+    train_iter = iter(train_loader)
+    val_iter = iter(val_loader)
+    batch = next(train_iter)
+    logging.info(f"Initialized data loaders:\n{training_utils.array_tree_to_info(batch)}")
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, train_loader)
+
+    # Create visualization callback if enabled
+    viz_callback = _visualization.create_visualization_callback(config) if config.visualization_enabled else None
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
+        out_shardings=(train_state_sharding, replicated_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+
+    # Create validation step function (no parameter updates)
+    @jax.jit
+    def validation_step(val_rng: at.KeyArrayLike, state: training_utils.TrainState, batch: tuple[_model.Observation, _model.Actions]):
+        model = nnx.merge(state.model_def, state.params)
+        model.eval()  # Set to evaluation mode
+        observation, actions = batch
+        model_outputs = model.compute_loss(val_rng, observation, actions, train=False)
+        return model_outputs
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -248,22 +273,75 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
-    infos = []
+    train_infos = []
+    val_infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
+            # Training step
+            train_state, info, model_outputs = ptrain_step(train_rng, train_state, batch)
+            
+            # Process training visualizations if enabled
+            if viz_callback is not None:
+                info = viz_callback.process_train_step(step, info, batch, model_outputs)
+            
+            train_infos.append(info)
+
+            # Validation step (every config.validation_interval steps)
+            if step % config.validation_interval == 0:
+                try:
+                    val_batch = next(val_iter)
+                except StopIteration:
+                    val_iter = iter(val_loader)
+                    val_batch = next(val_iter)
+                
+                # Create validation RNG key
+                val_rng = jax.random.fold_in(train_rng, step + 1000000)  # Add offset to make it different from train
+                val_outputs = validation_step(val_rng, train_state, val_batch)
+                
+                # Process validation visualizations if enabled
+                if viz_callback is not None:
+                    viz_callback.process_validation_step(step, val_batch, val_outputs)
+                
+                # Log validation metrics
+                val_info = {"val_loss": val_outputs["loss"]}
+                val_infos.append(val_info)
+
+        # Log metrics
         if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
-        batch = next(data_iter)
+            # Log training metrics
+            stacked_train_infos = common_utils.stack_forest(train_infos)
+            reduced_train_info = jax.device_get(jax.tree.map(jnp.mean, stacked_train_infos))
+            
+            # Filter out non-serializable values for wandb logging
+            wandb_train_info = {k: v for k, v in reduced_train_info.items() 
+                              if k not in ["model_def", "params"]}
+            
+            # Format numeric values with .4f precision for console output
+            train_info_str_parts = []
+            for k, v in reduced_train_info.items():
+                if k in ["model_def", "params"]:  # Skip non-numeric values
+                    continue
+                train_info_str_parts.append(f"{k}={v:.4f}")
+            train_info_str = ", ".join(train_info_str_parts)
+            
+            # Log validation metrics if available
+            if val_infos:
+                stacked_val_infos = common_utils.stack_forest(val_infos)
+                reduced_val_info = jax.device_get(jax.tree.map(jnp.mean, stacked_val_infos))
+                val_info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_val_info.items())
+                pbar.write(f"Step {step}: {train_info_str}, {val_info_str}")
+                wandb.log({**wandb_train_info, **reduced_val_info}, step=step)
+            else:
+                pbar.write(f"Step {step}: {train_info_str}")
+                wandb.log(wandb_train_info, step=step)
+            
+            train_infos = []
+            val_infos = []
+
+        batch = next(train_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            _checkpoints.save_state(checkpoint_manager, train_state, train_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

@@ -97,6 +97,7 @@ def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseMod
             for key in data_config.action_sequence_keys
         },
         local_files_only=data_config.local_files_only,
+        tolerance_s=0.05,
     )
 
     if data_config.prompt_from_task:
@@ -127,6 +128,64 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
     )
 
 
+def create_train_val_loaders(
+    config: _config.TrainConfig,
+    val_ratio: float = 0.1,  # 10% for validation
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    num_workers: int = 0,
+) -> tuple[DataLoader[tuple[_model.Observation, _model.Actions]], 
+          DataLoader[tuple[_model.Observation, _model.Actions]]]:
+    """Create training and validation data loaders.
+    
+    Args:
+        config: The training configuration
+        val_ratio: Ratio of data to use for validation (default: 0.1)
+        sharding: Optional sharding configuration
+        num_workers: Number of worker processes
+        
+    Returns:
+        Tuple of (train_loader, val_loader)
+    """
+    data_config = config.data.create(config.assets_dirs, config.model)
+
+    # Create the full dataset
+    dataset = create_dataset(data_config, config.model)
+    dataset = transform_dataset(dataset, data_config)
+    
+    # Calculate split sizes
+    total_size = len(dataset)
+    val_size = int(total_size * val_ratio)
+    train_size = total_size - val_size
+    
+    # Create train/val splits
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, 
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(config.seed)  # For reproducibility
+    )
+    
+    # Create train loader
+    train_loader = create_data_loader(
+        config,
+        sharding=sharding,
+        shuffle=True,
+        num_workers=num_workers,
+        dataset=train_dataset,
+    )
+    
+    # Create validation loader
+    val_loader = create_data_loader(
+        config,
+        sharding=sharding,
+        shuffle=False,  # No need to shuffle validation
+        num_workers=num_workers,
+        dataset=val_dataset,
+    )
+    
+    return train_loader, val_loader
+
+
 def create_data_loader(
     config: _config.TrainConfig,
     *,
@@ -135,25 +194,24 @@ def create_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     num_workers: int = 0,
+    dataset: Dataset | None = None,  # Add optional dataset parameter
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
     Args:
         config: The training configuration.
-        sharding: The sharding to use for the data loader. If None, the data loader will
-            use a single device sharding.
+        sharding: The sharding to use for the data loader.
         skip_norm_stats: Whether to skip data normalization.
         shuffle: Whether to shuffle the data.
-        num_batches: Determines the number of batches to return. If the number exceeds the
-            number of batches in the dataset, the data loader will loop over the dataset.
-            If not provided, will iterate over the dataset indefinitely.
-        num_workers: The number of worker processes to use. If zero, the data loader will
-            execute in the main process.
+        num_batches: Number of batches to return.
+        num_workers: Number of worker processes.
+        dataset: Optional pre-created dataset. If None, will create new dataset.
     """
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    dataset = create_dataset(data_config, config.model)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    if dataset is None:
+        dataset = create_dataset(data_config, config.model)
+        dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     data_loader = TorchDataLoader(
         dataset,
