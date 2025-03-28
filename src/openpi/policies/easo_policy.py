@@ -15,7 +15,6 @@ def make_easo_example() -> dict:
         "observation.target_eef_pose": np.random.rand(6),
         "observation.images.wrist_camera_right": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
         "actions": np.random.rand(7),
-        "timestamp": np.array([np.random.randint(1000000000)], dtype=np.int64),
     }
 
 

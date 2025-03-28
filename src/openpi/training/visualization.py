@@ -58,15 +58,21 @@ def compute_trajectory_metrics(pred_actions: np.ndarray, true_actions: np.ndarra
     pred_actions = convert_to_numpy(pred_actions)
     true_actions = convert_to_numpy(true_actions)
     
+    logging.info(f"pred_actions shape: {pred_actions.shape}, ndim: {pred_actions.ndim}")
+    logging.info(f"true_actions shape: {true_actions.shape}, ndim: {true_actions.ndim}")
+    
     # Action dimension labels
     action_labels = ['x', 'y', 'z', 'roll', 'pitch', 'yaw', 'gripper']
     
     # Compute MSE for each dimension
     metrics = {}
     for i, label in enumerate(action_labels):
+        if pred_actions.ndim == 1:
+            pred_actions = pred_actions[np.newaxis, :]
+        if true_actions.ndim == 1:
+            true_actions = true_actions[np.newaxis, :]
         dim_mse = float(np.mean((pred_actions[:, i] - true_actions[:, i]) ** 2))
         metrics[f"{label}_mse"] = dim_mse
-        # logging.info(f"{label.upper()} MSE: {dim_mse}")
     
     return metrics
 
@@ -323,6 +329,8 @@ def plot_easo_trajectory(
     
     # Compute metrics if we have predicted actions
     if pred_actions is not None:
+        logging.info(f"In plot_easo_trajectory - actions shape: {actions.shape}, ndim: {actions.ndim}")
+        logging.info(f"In plot_easo_trajectory - pred_actions shape: {pred_actions.shape}, ndim: {pred_actions.ndim}")
         metrics = compute_trajectory_metrics(pred_actions, actions)
         visualizations["metrics"] = metrics
 

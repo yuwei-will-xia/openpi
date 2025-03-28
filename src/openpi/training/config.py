@@ -350,7 +350,6 @@ class LeRobotEasoDataConfig(DataConfigFactory):
                         "observation.target_eef_pose": "observation.target_eef_pose",
                         "observation.images.wrist_camera_right": "observation.images.wrist_camera_right",
                         "actions": "actions",
-                        "timestamp": "timestamp"
                     }
                 )
             ]
@@ -738,7 +737,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora"
         ),
         data=LeRobotEasoDataConfig(
-            repo_id="willx0909/easo-dataset",
+            repo_id="willx0909/easo-insert-rel",
             base_config=DataConfig(
                 local_files_only=False,
             ),
@@ -767,6 +766,29 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_fast_easo_low_mem_finetune",
+        # Here is an example of loading a pi0-FAST model for LoRA finetuning.
+        # For setting action_dim, action_horizon, and max_token_len, see the comments above.
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=32, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ),
+        data=LeRobotEasoDataConfig(
+            repo_id="willx0909/easo-insert-rel",
+            base_config=DataConfig(
+                local_files_only=False,  # Set to True for local-only datasets.
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        # Again, make sure to match the model config above when extracting the freeze filter
+        # that specifies which parameters should be frozen during LoRA finetuning.
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
     ),
 ]
 
