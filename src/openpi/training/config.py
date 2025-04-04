@@ -25,6 +25,8 @@ import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
+import openpi.policies.easo_policy_js as easo_policy_js
+import openpi.policies.easo_policy_cart as easo_policy_cart
 
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
@@ -324,6 +326,118 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotEasoJsDataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms for the EASO robot dataset.
+    The EASO data format includes:
+    - Joint angles (7-dim)
+    - End effector pose (6-dim)
+    - Target end effector pose (6-dim)
+    - Wrist camera images (left and right)
+    - Actions (7-dim)
+    - Timestamps
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform maps the dataset keys to match the inference environment keys.
+        # For EASO, we keep the same key structure as in convert_to_lerobot.py
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.joint_angles": "observation.joint_angles",
+                        "observation.eef_pose": "observation.eef_pose",
+                        "observation.target_eef_pose": "observation.target_eef_pose",
+                        "observation.images.wrist_camera_right": "observation.images.wrist_camera_right",
+                        "actions": "actions",
+                    }
+                )
+            ]
+        )
+
+        # Data transforms handle the conversion of data to and from the model format
+        # We use the EasoInputs and EasoOutputs classes defined in easo_policy.py
+        data_transforms = _transforms.Group(
+            inputs=[easo_policy_js.EasoJsInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[easo_policy_js.EasoJsOutputs()],
+        )
+
+        # Convert absolute actions to delta actions for pi0 models for the first 7 joint angles
+        delta_action_mask = _transforms.make_bool_mask(7, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        # Model transforms for tokenizing prompts and resizing images
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # Return the complete data config
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotEasoCartDataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms for the EASO robot dataset.
+    The EASO data format includes:
+    - Joint angles (7-dim)
+    - End effector pose (6-dim)
+    - Target end effector pose (6-dim)
+    - Wrist camera images (left and right)
+    - Actions (7-dim)
+    - Timestamps
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform maps the dataset keys to match the inference environment keys.
+        # For EASO, we keep the same key structure as in convert_to_lerobot.py
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation.joint_angles": "observation.joint_angles",
+                        "observation.eef_pose": "observation.eef_pose",
+                        "observation.target_eef_pose": "observation.target_eef_pose",
+                        "observation.images.wrist_camera_right": "observation.images.wrist_camera_right",
+                        "actions": "actions",
+                    }
+                )
+            ]
+        )
+
+        # Data transforms handle the conversion of data to and from the model format
+        # We use the EasoInputs and EasoOutputs classes defined in easo_policy.py
+        data_transforms = _transforms.Group(
+            inputs=[easo_policy_cart.EasoCartInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[easo_policy_cart.EasoCartOutputs()],
+        )
+
+        # Convert absolute actions to delta actions for the first 6 target eef pose dimensions (x,y,z,rpy)
+        delta_action_mask = _transforms.make_bool_mask(6, -1)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        # Model transforms for tokenizing prompts and resizing images
+        model_transforms = ModelTransformFactory()(model_config)
+
+        # Return the complete data config
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -388,6 +502,13 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+
+    # Visualization settings
+    visualization_enabled: bool = True
+    visualization_interval: int = 100  # How often to generate visualizations
+    max_trajectories_to_visualize: int = 1
+    max_frames_per_trajectory: int = 5
+    save_visualizations: bool = True  # Whether to save visualizations to disk
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -479,30 +600,17 @@ _CONFIGS = [
     # For your own dataset, you can copy this class and modify the dataset name, and data transforms based on
     # the comments below.
     TrainConfig(
-        # Change the name to reflect your model and dataset.
         name="pi0_libero",
-        # Here you define the model config -- In this example we use pi0 as the model
-        # architecture and perform *full* finetuning. in the examples below we show how to modify
-        # this to perform *low-memory* (LORA) finetuning and use pi0-FAST as an alternative architecture.
         model=pi0.Pi0Config(),
-        # Here you define the dataset you are training on. In this example we use the Libero
-        # dataset. For your own dataset, you can change the repo_id to point to your dataset.
-        # Also modify the DataConfig to use the new config you made for your dataset above.
+        num_workers=1,
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(
-                local_files_only=False,  # Set to True for local-only datasets.
-                # This flag determines whether we load the prompt (i.e. the task instruction) from the
-                # ``task`` field in the LeRobot dataset. If set to True, the prompt will show up in
-                # a field called ``prompt`` in the input dict. The recommended setting is True.
+                local_files_only=False,
                 prompt_from_task=True,
             ),
         ),
-        # Here you define which pre-trained checkpoint you want to load to initialize the model.
-        # This should match the model config you chose above -- i.e. in this case we use the pi0 base model.
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        # Below you can define other hyperparameters like the learning rate, number of training steps, etc.
-        # Check the base TrainConfig class for a full list of available hyperparameters.
         num_train_steps=30_000,
     ),
     TrainConfig(
@@ -649,6 +757,51 @@ _CONFIGS = [
         exp_name="debug",
         num_train_steps=10,
         wandb_enabled=False,
+    ),
+    #
+    # Fine-tuning EASO configs.
+    #
+    TrainConfig(
+        name="easo_js",
+        # Example of pi0 model with LoRA fine-tuning for lower memory usage
+        model=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ),
+        data=LeRobotEasoJsDataConfig(
+            repo_id="willx0909/easo-insert-rel-2",
+            base_config=DataConfig(
+                local_files_only=False,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=100_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,  # Turn off EMA for LoRA finetuning
+    ),
+    TrainConfig(
+        name="easo_cart",
+        # Example of pi0 model with LoRA fine-tuning for lower memory usage
+        model=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ),
+        data=LeRobotEasoCartDataConfig(
+            repo_id="willx0909/easo-insert-rel-2",
+            base_config=DataConfig(
+                local_files_only=False,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=100_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,  # Turn off EMA for LoRA finetuning
     ),
 ]
 

@@ -263,7 +263,14 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        # Sample predicted actions for visualization
+        pred_actions = self.sample_actions(rng, observation)
+
+        # Return both loss and predicted actions
+        return {
+            "loss": jnp.mean(jnp.square(v_t - u_t), axis=-1),
+            "predicted_actions": pred_actions
+        }
 
     @override
     def sample_actions(

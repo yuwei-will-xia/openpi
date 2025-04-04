@@ -7,6 +7,7 @@ import flax.traverse_util as traverse_util
 import jax
 import numpy as np
 from openpi_client import image_tools
+from scipy.spatial.transform import Rotation
 
 from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
@@ -195,7 +196,11 @@ class SubsampleActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class DeltaActions(DataTransformFn):
-    """Repacks absolute actions into delta action space."""
+    """Repacks absolute actions into delta action space.
+    
+    For joint angles, this simply subtracts the current state from the target.
+    For xyz-rpy poses, this computes the relative transform from current state to target.
+    """
 
     # Boolean mask for the action dimensions to be repacked into delta action space. Length
     # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
@@ -209,15 +214,46 @@ class DeltaActions(DataTransformFn):
         state, actions = data["state"], data["actions"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
-        actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
-        data["actions"] = actions
 
+        # Handle xyz-rpy poses (6D) specially
+        if dims == 6:
+            # Extract xyz and rpy components
+            curr_xyz = state[..., :3]
+            curr_rpy = state[..., 3:6]
+            target_xyz = actions[..., :3]
+            target_rpy = actions[..., 3:6]
+
+            # Convert current and target RPY to rotation matrices
+            curr_rot = Rotation.from_euler('xyz', curr_rpy)
+            target_rot = Rotation.from_euler('xyz', target_rpy)
+
+            # Compute relative transform
+            # For position: target_xyz - curr_xyz
+            delta_xyz = target_xyz - np.expand_dims(curr_xyz, axis=-2)
+
+            # For rotation: relative_rot = curr_rot.inv() * target_rot
+            # Then convert back to euler angles
+            relative_rot = curr_rot.inv() * target_rot
+            delta_rpy = relative_rot.as_euler('xyz')
+
+            # Combine xyz and rpy deltas
+            actions[..., :3] = delta_xyz
+            actions[..., 3:6] = delta_rpy
+        else:
+            # For other dimensions (e.g. joint angles), just subtract current state
+            actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+
+        data["actions"] = actions
         return data
 
 
 @dataclasses.dataclass(frozen=True)
 class AbsoluteActions(DataTransformFn):
-    """Repacks delta actions into absolute action space."""
+    """Repacks delta actions into absolute action space.
+    
+    For joint angles, this simply adds the current state to the delta.
+    For xyz-rpy poses, this computes the absolute transform from current state and relative transform.
+    """
 
     # Boolean mask for the action dimensions to be repacked into absolute action space. Length
     # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
@@ -231,9 +267,36 @@ class AbsoluteActions(DataTransformFn):
         state, actions = data["state"], data["actions"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
-        actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
-        data["actions"] = actions
 
+        # Handle xyz-rpy poses (6D) specially
+        if dims == 6:
+            # Extract xyz and rpy components
+            curr_xyz = state[..., :3]
+            curr_rpy = state[..., 3:6]
+            delta_xyz = actions[..., :3]
+            delta_rpy = actions[..., 3:6]
+
+            # Convert current RPY and delta RPY to rotation matrices
+            curr_rot = Rotation.from_euler('xyz', curr_rpy)
+            delta_rot = Rotation.from_euler('xyz', delta_rpy)
+
+            # Compute absolute transform
+            # For position: curr_xyz + delta_xyz
+            abs_xyz = np.expand_dims(curr_xyz, axis=-2) + delta_xyz
+
+            # For rotation: abs_rot = curr_rot * delta_rot
+            # Then convert back to euler angles
+            abs_rot = curr_rot * delta_rot
+            abs_rpy = abs_rot.as_euler('xyz')
+
+            # Combine xyz and rpy absolutes
+            actions[..., :3] = abs_xyz
+            actions[..., 3:6] = abs_rpy
+        else:
+            # For other dimensions (e.g. joint angles), just add current state
+            actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+
+        data["actions"] = actions
         return data
 
 
