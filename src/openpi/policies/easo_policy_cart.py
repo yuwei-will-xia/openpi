@@ -14,7 +14,7 @@ def make_easo_example() -> dict:
         "observation.eef_pose": np.random.rand(6),
         "observation.target_eef_pose": np.random.rand(6),
         "observation.images.wrist_camera_right": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
-        "actions": np.random.rand(7),
+        "actions": np.random.rand(8),
     }
 
 
@@ -28,7 +28,7 @@ def _parse_image(image) -> np.ndarray:
 
 
 @dataclasses.dataclass(frozen=True)
-class EasoInputs(transforms.DataTransformFn):
+class EasoCartInputs(transforms.DataTransformFn):
     """
     This class is used to convert inputs from the EASO robot data format to the model's expected format.
     The EASO data format includes joint angles, end effector poses, and camera images from multiple views.
@@ -44,8 +44,8 @@ class EasoInputs(transforms.DataTransformFn):
         # We only mask padding for pi0 model, not pi0-FAST
         mask_padding = self.model_type == _model.ModelType.PI0
 
-        # Combine joint angles and eef pose as the state input
-        state = np.concatenate([data["observation.joint_angles"], data["observation.eef_pose"]])
+        # Use eef pose as state input
+        state = data["observation.eef_pose"]
         state = transforms.pad_to_dim(state, self.action_dim)
 
 
@@ -72,24 +72,24 @@ class EasoInputs(transforms.DataTransformFn):
 
         # Handle actions if present (during training)
         if "actions" in data:
-            actions = transforms.pad_to_dim(data["actions"], self.action_dim)
+            # use absolute target pose as action input
+            actions = data["observation.target_eef_pose"]
+            actions = transforms.pad_to_dim(actions, self.action_dim)
             inputs["actions"] = actions
 
         # Add target pose information as part of the prompt
         # This helps the model understand the desired end effector position
-        target_pose = data["observation.target_eef_pose"]
-        target_str = f"Move end effector to position ({target_pose[0]:.3f}, {target_pose[1]:.3f}, {target_pose[2]:.3f}) with orientation ({target_pose[3]:.3f}, {target_pose[4]:.3f}, {target_pose[5]:.3f})"
+        target_str = f"insert vials into the tray"
         inputs["prompt"] = target_str
 
         return inputs
 
 
 @dataclasses.dataclass(frozen=True)
-class EasoOutputs(transforms.DataTransformFn):
+class EasoCartOutputs(transforms.DataTransformFn):
     """
     Converts model outputs back to the EASO-specific format.
     """
 
     def __call__(self, data: dict) -> dict:
-        # Return the first 7 dimensions of actions (joint angles)
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        return {"actions": np.asarray(data["actions"][:, :6])}
